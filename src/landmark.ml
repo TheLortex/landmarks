@@ -8,149 +8,6 @@ exception LandmarkFailure of string
 
 module Graph = Graph
 
-module SparseArray = struct
-  type 'a t = {
-    mutable keys : int array;
-    mutable data : 'a array;
-    mutable size : int;
-  }
-
-  (* /!\ Dummy cannot be resized. *)
-  let dummy () = { keys = [||]; data = [||]; size = 0 }
-
-  let make null n =
-    let n = max n 1 in
-    {
-      keys = Array.make n 0;
-      data = Array.make n null;
-      size = 0;
-    }
-
-  let reset sparse_array = sparse_array.size <- 0
-
-  let get {keys; data; size} id =
-    let min = ref 0 in
-    let max = ref (size - 1) in
-    while !min < !max do
-      let middle = (!min + !max) / 2 in
-      if Array.unsafe_get keys middle < id then
-        min := middle + 1
-      else
-        max := middle
-    done;
-    let idx = !min in
-    if idx = !max &&
-       Array.unsafe_get keys idx = id then
-      Array.unsafe_get data idx
-    else
-      raise Not_found
-
-  let swap a i j =
-    let t = a.(i) in
-    a.(i) <- a.(j);
-    a.(j) <- t
-
-  let values {data; size; _} =
-    let result = ref [] in
-    for k = 0 to size-1 do
-      result := data.(k) :: !result;
-    done;
-    List.rev !result
-
-  let bubble {keys; data; size} =
-    let pos = ref size in
-    let key = keys.(size) in
-    while
-      let p = !pos in
-      let q = p - 1 in
-      if key < keys.(q) then begin
-        swap keys p q;
-        swap data p q;
-        pos := q;
-        q > 0
-      end else false
-    do () done
-
-  let is_full ({keys; size; _}) = Array.length keys = size
-
-  let resize ({keys; data; size} as sparse_array) =
-    if is_full sparse_array then begin
-      assert (size > 0);
-      let new_length = (2 * (size + 1)) - 1 in
-      sparse_array.keys <- Array.make new_length 0;
-      sparse_array.data <- Array.make new_length sparse_array.data.(0);
-      Array.blit keys 0 sparse_array.keys 0 size;
-      Array.blit data 0 sparse_array.data 0 size;
-    end
-
-  let set sparse_array id node =
-    resize sparse_array;
-    let size = sparse_array.size in
-    sparse_array.keys.(size) <- id;
-    sparse_array.data.(size) <- node;
-    if size > 0 then
-      bubble sparse_array;
-    sparse_array.size <- sparse_array.size + 1
-end
-
-module Stack = struct
-  module A = struct
-    type (_, _) kind =
-      | Array : ('a, 'a array) kind
-      | Float : (float, floatarray) kind
-    let empty : type a arr. (a, arr) kind -> arr = function
-      | Array -> [||]
-      | Float -> Float.Array.create 0
-    let make : type a arr. (a, arr) kind -> int -> a -> arr = fun kind n null ->
-      match kind with
-      | Array -> Array.make n null
-      | Float -> Float.Array.make n null
-    let length : type a arr. (a, arr) kind -> arr -> int = fun kind arr ->
-      match kind with
-      | Array -> Array.length arr
-      | Float -> Float.Array.length arr
-    let get : type a arr. (a, arr) kind -> arr -> int -> a = fun kind arr n ->
-      match kind with
-      | Array -> Array.get arr n
-      | Float -> Float.Array.get arr n
-    let set : type a arr. (a, arr) kind -> arr -> int -> a -> unit = fun kind arr n ->
-      match kind with
-      | Array -> Array.set arr n
-      | Float -> Float.Array.set arr n
-    let blit : type a arr. (a, arr) kind -> arr -> int -> arr -> int -> int -> unit = fun kind src srcpos dst dstpos n ->
-      match kind with
-      | Array -> Array.blit src srcpos dst dstpos n
-      | Float -> Float.Array.blit src srcpos dst dstpos n
-  end
-  type ('a, 'arr) t = {
-    kind : ('a, 'arr) A.kind;
-    mutable data : 'arr;
-    mutable size : int
-  }
-  (* /!\ Dummy cannot be resized. *)
-  let dummy kind = { kind; data = A.empty kind; size = 0 }
-  let make kind null n = { kind; data = A.make kind (max 1 n) null; size = 0 }
-  let size {size; _} = size
-  let resize ({kind; size; data} as stack) =
-    if size = A.length kind data then begin
-      assert (size > 0);
-      let new_length = (2 * (size + 1)) - 1 in
-      stack.data <- A.make kind new_length (A.get kind data 0);
-      A.blit kind data 0 stack.data 0 size;
-    end
-
-  let push stack x =
-    resize stack;
-    A.set stack.kind stack.data stack.size x;
-    stack.size <- stack.size + 1
-
-  let pop stack =
-    stack.size <- stack.size - 1;
-    A.get stack.kind stack.data stack.size
-
-  let to_floatarray {data; size; _} = Float.Array.sub data 0 size
-end
-
 type landmark = {
   id: int;
   kind : Graph.kind;
@@ -160,7 +17,7 @@ type landmark = {
 
   mutable last_parent: node;
   mutable last_son: node;
-  mutable last_self: node;
+  last_self: (StackInfo.id, node) Hashtbl.t;
 }
 
 and node = {
@@ -170,6 +27,7 @@ and node = {
 
   children: node SparseArray.t;
   fathers: (node, node array) Stack.t;
+  stack_id: StackInfo.id;
 
   mutable calls: int;
   mutable recursive_calls: int;
@@ -206,12 +64,13 @@ let rec landmark_root = {
   user_id = None;
   last_parent = dummy_node;
   last_son = dummy_node;
-  last_self = dummy_node;
+  last_self = Hashtbl.create 1;
 }
 
 and dummy_node = {
   landmark = landmark_root;
   id = 0;
+  stack_id = Obj.magic 0; (* TODO *)
   children = SparseArray.dummy ();
   fathers = Stack.dummy Array;
   floats = new_floats ();
@@ -261,7 +120,7 @@ let new_landmark ?user_id ~name ~location ~kind () =
       kind;
       user_id;
       last_parent = dummy_node;
-      last_self = dummy_node;
+      last_self = Hashtbl.create 1;
       last_son = dummy_node;
     }
   in
@@ -273,6 +132,8 @@ let new_landmark ?user_id ~name ~location ~kind () =
   end;
   res
 
+let current_stack = StackInfo.alloc ()
+
 let node_id_ref = ref 0
 let allocated_nodes = ref []
 let new_node landmark =
@@ -283,6 +144,7 @@ let new_node landmark =
   let node = {
     landmark;
     id;
+    stack_id = Obj.magic 0; (* TODO *)
 
     fathers = Stack.make Array dummy_node 1;
     distrib = Stack.make Float 0.0 0;
@@ -375,7 +237,15 @@ let register_sampler name =
   let call_stack = Printexc.get_callstack 4 in
   register_generic Graph.Sampler name call_stack
 
-let current_node_ref = ref !current_root_node
+let init_current_node () =
+  let hashtable = Hashtbl.create 2 in
+  StackInfo.get current_stack; 
+  let root_id = StackInfo.id current_stack in
+  Hashtbl.add hashtable root_id !current_root_node;
+  hashtable
+
+let current_node_ref = ref (init_current_node ())
+
 let cache_miss_ref = ref 0
 
 let stamp_root () =
@@ -389,7 +259,7 @@ let clear_cache () =
   let reset_landmark landmark =
     landmark.last_son <- dummy_node;
     landmark.last_parent <- dummy_node;
-    landmark.last_self <- dummy_node;
+    Hashtbl.clear landmark.last_self;
   in
   List.iter reset_landmark !registered_landmarks
 
@@ -397,7 +267,7 @@ type profiling_state = {
   root : node;
   nodes: node_info list;
   nodes_len: int;
-  current: node;
+  current: (StackInfo.id, node) Hashtbl.t;
   cache_miss: int
 }
 and node_info = {
@@ -407,7 +277,7 @@ and node_info = {
 
 let profiling_stack =
   let dummy =
-    {root = dummy_node; current = dummy_node; nodes = [{node = dummy_node; recursive = false}]; cache_miss = 0; nodes_len = 1}
+    {root = dummy_node; current = Hashtbl.create 0; nodes = [{node = dummy_node; recursive = false}]; cache_miss = 0; nodes_len = 1}
   in
   Stack.make Array dummy 7
 
@@ -416,7 +286,8 @@ let push_profiling_state () =
     Printf.eprintf "[Profiling] Push profiling state ....\n%!";
   let state =
     let node_info node =
-      let recursive = node.landmark.last_self == node in
+      (* TODO: understand *)
+      let recursive = false in
       { node; recursive }
     in
     {
@@ -429,7 +300,7 @@ let push_profiling_state () =
   in
   clear_cache ();
   current_root_node := new_node landmark_root;
-  current_node_ref := !current_root_node;
+  current_node_ref := init_current_node ();
   cache_miss_ref := 0;
   allocated_nodes := [!current_root_node];
   node_id_ref := 1;
@@ -441,7 +312,7 @@ let pop_profiling_state () =
     current_root_node := root;
     current_node_ref := current;
     cache_miss_ref := cache_miss;
-    allocated_nodes := List.map (fun {node; recursive} -> if recursive then node.landmark.last_self <- node; node) nodes;
+    allocated_nodes := List.map (fun {node; _} -> node) nodes;
     node_id_ref := nodes_len
 
 let reset () =
@@ -457,32 +328,50 @@ let reset () =
   stamp_root ();
   SparseArray.reset !current_root_node.children;
   allocated_nodes := [!current_root_node];
-  current_node_ref := !current_root_node;
+  current_node_ref := init_current_node ();
   cache_miss_ref := 0;
   clear_cache ();
   node_id_ref := 1
 
 let () = reset ()
 
-let unroll_until node =
+let unroll_until _node =
+  failwith "unimplemented"(*;
   while
-    let current_node = !current_node_ref in
+    let current_node = Hashtbl.find !current_node_ref node.stack_id in
     current_node != node
     && Stack.size current_node.fathers > 0
-    && (current_node_ref := Stack.pop current_node.fathers; true)
-  do () done
+    && (Hashtbl.add !current_node_ref node.stack_id (Stack.pop current_node.fathers); true)
+  do () done*)
 
-let landmark_failure msg =
+let landmark_failure _msg =
+  failwith "unimplemented"
+  (*
   unroll_until !current_root_node;
   if !current_node_ref != !current_root_node then
     reset ();
   if !profile_with_debug then
     (Printf.eprintf "Landmark error: %s\n%!" msg; Stdlib.exit 2)
   else
-    raise (LandmarkFailure msg)
+    raise (LandmarkFailure msg)*)
+
+let current_stack_id () =
+  StackInfo.get current_stack;
+  StackInfo.id current_stack
+
+let get_current_node () =
+  StackInfo.get current_stack;
+  let rec loop () = 
+    match Hashtbl.find_opt !current_node_ref (StackInfo.id current_stack) with
+    | Some v -> v
+    | None when StackInfo.parent current_stack -> loop ()
+    | None -> failwith "Stack underflow"
+  in
+  loop ()
+
 
 let get_entering_node ({id;_} as landmark) =
-  let current_node = !current_node_ref in
+  let current_node = get_current_node () in
   (* Read the "cache". *)
   if current_node == landmark.last_parent && landmark.last_son != dummy_node then
     landmark.last_son
@@ -526,23 +415,34 @@ let sample sampler x =
   if !profiling_ref then
     sample sampler x
 
-let enter landmark =
-  if !profile_with_debug then
-    Printf.eprintf "[Profiling] enter%s(%s)\n%!" (if landmark.last_self != dummy_node then " recursive " else "") landmark.name;
+let get_stack v () =
+  StackInfo.get current_stack;
+  let id = StackInfo.id current_stack in
+  if StackInfo.parent current_stack then Printf.printf "|%s>%x => %x\n%!" v id (StackInfo.id current_stack)
+  else Printf.printf "|%s>%x (root)\n%!" v id
 
-  if landmark.last_self == dummy_node || !profile_recursive then begin
+let enter landmark =
+  let stack_id = current_stack_id () in
+  let recursive = Hashtbl.mem landmark.last_self stack_id in
+
+  if !profile_with_debug then
+    Printf.eprintf "[Profiling] enter%s(%s, %x)\n%!" (if recursive then " recursive " else "") landmark.name stack_id;
+
+  if (not recursive) || !profile_recursive then begin
+    (* not a recursive call *)
     let node = get_entering_node landmark in
     node.calls <- node.calls + 1;
-    Stack.push node.fathers !current_node_ref;
-    current_node_ref := node;
-    landmark.last_self <- node;
+    let current_node = get_current_node () in
+    Stack.push node.fathers current_node;
+    Hashtbl.add !current_node_ref stack_id node;
+    Hashtbl.add landmark.last_self stack_id node;
     node.timestamp <- clock ();
     if !profile_with_allocated_bytes then
       node.floats.allocated_bytes_stamp <- Gc.allocated_bytes ();
     if !profile_with_sys_time then
       node.floats.sys_timestamp <- Sys.time ()
   end else begin
-    let last_self = landmark.last_self in
+    let last_self = Hashtbl.find landmark.last_self stack_id in
     last_self.recursive_calls <- last_self.recursive_calls + 1;
     last_self.calls <- last_self.calls + 1
   end
@@ -556,11 +456,11 @@ let mismatch_recovering landmark current_node =
         expected_landmark.name expected_landmark.location
     in
     Printf.eprintf "Warning: %s\n%!" msg;
-    unroll_until landmark.last_self;
-    if landmark != !current_node_ref.landmark then begin
+    (*unroll_until landmark.last_self;
+    if landmark != !current_node_ref.landmark then begin*)
       reset ();
       landmark_failure ("unable to recover from "^msg)
-    end
+    (*end*)
   end
 
 let aggregate_stat_for current_node =
@@ -575,17 +475,33 @@ let aggregate_stat_for current_node =
                        +. (Sys.time () -. floats.sys_timestamp)
 
 let exit landmark =
+
+  let stack_id = current_stack_id () in
+  let recursive = 
+    try Hashtbl.find landmark.last_self stack_id != get_current_node () with
+    | Not_found -> false 
+  in
+
   if !profile_with_debug then
-    Printf.eprintf "[Profiling] exit%s(%s)\n%!" (if landmark.last_self != !current_node_ref then " recursive " else "") landmark.name;
-  let current_node = !current_node_ref in
-  let last_self = landmark.last_self in
+    Printf.eprintf "[Profiling] exit%s(%s, %x)\n%!" (if recursive then " recursive " else "") landmark.name (current_stack_id () |> Obj.magic);
+  let current_node = get_current_node () in
+  let last_self = 
+    try Hashtbl.find landmark.last_self stack_id with
+    | Not_found -> dummy_node
+  in
   if last_self.recursive_calls = 0 || !profile_recursive then begin
     mismatch_recovering landmark current_node;
     if Stack.size current_node.fathers = 1 then begin
-      landmark.last_self <- dummy_node;
+      Hashtbl.remove landmark.last_self stack_id;
       aggregate_stat_for current_node;
     end;
-    current_node_ref := get_exiting_node current_node
+    let _ = 
+      if Stack.size current_node.fathers = 0 then
+        landmark_failure "Stack underflow"
+      else
+        Stack.pop current_node.fathers 
+    in
+    Hashtbl.remove !current_node_ref (current_stack_id ())
   end
   else if not !profile_recursive then
     last_self.recursive_calls <- last_self.recursive_calls - 1
@@ -667,8 +583,9 @@ let start_profiling ?(profiling_options = default_options) () =
   profiling_ref := true
 
 let rec exit_until_root () =
-  if !current_node_ref != !current_root_node then begin
-    let landmark = !current_node_ref.landmark in
+  let current_node = get_current_node () in
+  if current_node != !current_root_node then begin
+    let landmark = current_node.landmark in
     exit landmark;
     exit_until_root ();
   end
@@ -677,7 +594,7 @@ let stop_profiling () =
   if not !profiling_ref then
     failwith "In profiling: cannot stop since profiling is not on-going";
   exit_until_root ();
-  let current_node = !current_node_ref in
+  let current_node = get_current_node () in
   assert (current_node == !current_root_node);
   aggregate_stat_for current_node;
   if !profile_with_debug then

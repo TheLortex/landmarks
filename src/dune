@@ -5,6 +5,6 @@
   (:standard -w +A-30-42-41-40-4 -safe-string -strict-sequence))
  (foreign_stubs
   (language c)
-  (names clock))
+  (names clock stack))
  (instrumentation.backend
   (ppx landmarks-ppx)))
